@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use bincode::{Decode, Encode};
 use dashmap::DashMap;
+use lasso::ThreadedRodeo;
 use rayon::prelude::*;
 use scraper::{Html, Selector};
-use std::thread;
-use std::time::Duration;
 use std::time::Instant;
+use std::{sync::Arc, thread};
 use zim_rs::archive::Archive;
 use zim_rs::entry::Entry;
 
@@ -46,7 +46,7 @@ struct Page {
 }
 
 impl Page {
-    fn from_entry(e: Entry, a: &Archive) -> Option<Self> {
+    fn from_entry(e: Entry) -> Option<Self> {
         let i = e.get_item(true).ok()?;
         let blob = i.get_data().ok()?;
         let d = blob.data();
@@ -96,7 +96,7 @@ fn linear_distance(i: usize, total: usize) -> f32 {
 
 pub struct WikiGraph {
     pub a: Archive,
-    link_to_page: HashMap<String, Page>,
+    link_to_page: DashMap<String, Page>,
 }
 
 impl WikiGraph {
@@ -104,7 +104,7 @@ impl WikiGraph {
         let a = Archive::new(file_path).unwrap();
         WikiGraph {
             a,
-            link_to_page: HashMap::new(),
+            link_to_page: DashMap::new(),
         }
     }
     pub fn add_link(&mut self, link: &str) -> bool {
@@ -112,7 +112,7 @@ impl WikiGraph {
             return false;
         }
         if let Ok(e) = self.a.get_entry_bypath_str(link)
-            && let Some(page) = Page::from_entry(e, &self.a)
+            && let Some(page) = Page::from_entry(e)
         {
             self.link_to_page.insert(link.to_string(), page);
             return true;
@@ -120,72 +120,40 @@ impl WikiGraph {
         false
     }
 
-    pub fn expand(&mut self) {
-        dbg!(self.link_to_page.len());
-        let mut links: HashSet<String> = self
-            .link_to_page
-            .iter()
-            .flat_map(|p| p.1.all_links.to_vec())
-            .collect();
-        while !links.is_empty() {
-            dbg!(links.len());
-
-            links = links
-                .iter()
-                .filter_map(|link| {
-                    if self.link_to_page.contains_key(link) {
-                        return None;
-                    }
-                    if let Ok(e) = self.a.get_entry_bypath_str(link)
-                        && let Some(page) = Page::from_entry(e, &self.a)
-                    {
-                        let links_for_this = page
-                            .links_to_weight
-                            .keys()
-                            .filter(|s| !self.link_to_page.contains_key(*s))
-                            .cloned()
-                            .collect::<HashSet<String>>();
-                        self.link_to_page.insert(link.to_string(), page);
-                        return Some(links_for_this);
-                    }
-                    None
-                })
-                .flatten()
-                .collect::<HashSet<String>>();
-        }
-    }
-
     pub fn get_all(&mut self) {
-        let mut entry_err_count = 0;
-        let mut page_err_count = 0;
         let start = Instant::now();
-        for (i, e) in self.a.iter_efficient().unwrap().into_iter().enumerate() {
-            if i % 1000 == 0 {
-                println!("{}", i);
-            }
-            if i >= 10_000 {
+        let mut entry_iter = self.a.iter_efficient().unwrap().into_iter();
+        let mut count = 0;
+        loop {
+            let entries: Vec<Entry> = entry_iter
+                .by_ref()
+                .map(|e| e.unwrap())
+                .take(5_000)
+                .collect();
+            if entries.is_empty() {
                 break;
             }
-            if let Ok(entry) = e {
-                let path = entry.get_path();
-                if let Some(p) = Page::from_entry(entry, &self.a) {
+            count += entries.len();
+            println!("{}", count);
+
+            entries.into_iter().par_bridge().for_each(|e| {
+                let path = e.get_path();
+                if let Some(p) = Page::from_entry(e) {
                     self.link_to_page.insert(path, p);
-                } else {
-                    page_err_count += 1;
                 }
-            } else {
-                entry_err_count += 1;
-            }
+            })
         }
         let duration = Instant::now().duration_since(start);
         dbg!(duration);
-        dbg!(page_err_count, entry_err_count);
         dbg!(self.link_to_page.len());
     }
 
     pub fn save_bin(&self) -> std::io::Result<()> {
-        let encoded =
-            bincode::encode_to_vec(&self.link_to_page, bincode::config::standard()).unwrap();
+        let encoded = bincode::encode_to_vec(
+            dash_to_hash(&self.link_to_page),
+            bincode::config::standard(),
+        )
+        .unwrap();
         std::fs::write(WIKI_GRAPH_PATH, encoded)?;
         Ok(())
     }
@@ -197,7 +165,10 @@ impl WikiGraph {
             bincode::decode_from_slice(&bytes, bincode::config::standard())
                 .unwrap()
                 .0;
-        Ok(WikiGraph { a, link_to_page })
+        Ok(WikiGraph {
+            a,
+            link_to_page: hash_to_dash(link_to_page),
+        })
     }
 }
 
@@ -211,5 +182,5 @@ fn main() {
     // dbg!(e.get_title());
     // wiki_graph.add_link(&e.get_path());
     // wiki_graph.expand();
-    // wiki_graph.save_bin().unwrap();
+    wiki_graph.save_bin().unwrap();
 }
