@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rayon = "1.11.0"
 scraper = "0.24.0"
 zim-rs = "0.1.1"
