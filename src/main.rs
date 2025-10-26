@@ -1,18 +1,45 @@
 use std::collections::{HashMap, HashSet};
 
+use bincode::{Decode, Encode};
+use dashmap::DashMap;
 use rayon::prelude::*;
 use scraper::{Html, Selector};
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 use zim_rs::archive::Archive;
 use zim_rs::entry::Entry;
-use zim_rs::search::{Query, Searcher};
 
-#[derive(Debug, Clone)]
+const WIKI_GRAPH_PATH: &str = "wiki-graph";
+
+fn hash_to_dash<K, V>(hm: HashMap<K, V>) -> DashMap<K, V>
+where
+    K: Eq + std::hash::Hash,
+{
+    let dm = DashMap::new();
+    for (k, v) in hm {
+        dm.insert(k, v);
+    }
+    dm
+}
+
+fn dash_to_hash<K, V>(dm: &DashMap<K, V>) -> HashMap<K, V>
+where
+    K: Clone + Eq + std::hash::Hash,
+    V: Clone,
+{
+    dm.iter()
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect()
+}
+
+#[derive(Debug, Clone, Decode, Encode)]
 struct LinkInfo {
     index: usize,
     weight: f32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Decode, Encode)]
 struct Page {
     all_links: Vec<String>,
     links_to_weight: HashMap<String, LinkInfo>,
@@ -30,14 +57,15 @@ impl Page {
         let selector = Selector::parse("a[href]").ok()?;
         let all_links = doc
             .select(&selector)
-            .filter_map(|e| a.get_entry_bypath_str(e.attr("href")?).ok())
-            .map(|e| e.get_path())
+            // Assume it is ok
+            // .filter_map(|e| a.get_entry_bypath_str(e.attr("href")?).ok())
+            .filter_map(|e| e.attr("href"))
             .fold(
                 (HashSet::new(), Vec::new()),
                 |(mut seen_paths, mut paths), p| {
-                    let did_add = seen_paths.insert(p.clone());
+                    let did_add = seen_paths.insert(p);
                     if did_add {
-                        paths.push(p)
+                        paths.push(p.to_string())
                     }
                     (seen_paths, paths)
                 },
@@ -91,77 +119,97 @@ impl WikiGraph {
         }
         false
     }
-    pub fn expand(&mut self, steps: usize) {
+
+    pub fn expand(&mut self) {
         dbg!(self.link_to_page.len());
-        if steps == 0 {
-            return;
-        }
-
-        let links: Vec<String> = self
+        let mut links: HashSet<String> = self
             .link_to_page
-            .values()
-            .flat_map(|p| p.all_links.iter().cloned())
+            .iter()
+            .flat_map(|p| p.1.all_links.to_vec())
             .collect();
+        while !links.is_empty() {
+            dbg!(links.len());
 
-        dbg!(links.len());
-
-        // Parallel section
-        let new_pages: Vec<(String, Page)> = links
-            .par_iter()
-            .filter_map(|link| {
-                // Skip if already loaded
-                if self.link_to_page.contains_key(link) {
-                    return None;
-                }
-                if let Ok(e) = self.a.get_entry_bypath_str(link)
-                    && let Some(page) = Page::from_entry(e, &self.a)
-                {
-                    Some((link.clone(), page))
-                } else {
+            links = links
+                .iter()
+                .filter_map(|link| {
+                    if self.link_to_page.contains_key(link) {
+                        return None;
+                    }
+                    if let Ok(e) = self.a.get_entry_bypath_str(link)
+                        && let Some(page) = Page::from_entry(e, &self.a)
+                    {
+                        let links_for_this = page
+                            .links_to_weight
+                            .keys()
+                            .filter(|s| !self.link_to_page.contains_key(*s))
+                            .cloned()
+                            .collect::<HashSet<String>>();
+                        self.link_to_page.insert(link.to_string(), page);
+                        return Some(links_for_this);
+                    }
                     None
-                }
-            })
-            .collect();
-
-        // Sequential insertion (to avoid concurrent mutation)
-        for (link, page) in new_pages {
-            self.link_to_page.insert(link, page);
+                })
+                .flatten()
+                .collect::<HashSet<String>>();
         }
-
-        self.expand(steps - 1);
     }
 
-    pub fn expand(&mut self, steps: usize) {
-        for _ in 0..steps {
-            dbg!(self.link_to_page.len());
-            if steps == 0 {
-                return;
+    pub fn get_all(&mut self) {
+        let mut entry_err_count = 0;
+        let mut page_err_count = 0;
+        let start = Instant::now();
+        for (i, e) in self.a.iter_efficient().unwrap().into_iter().enumerate() {
+            if i % 1000 == 0 {
+                println!("{}", i);
             }
-            // I could do A better breadthfirst by sorted based of distance
-            // technically this clone might not be needed if we rearranged the values
-            let links = self
-                .link_to_page
-                .values()
-                .flat_map(|p| p.all_links.iter().cloned())
-                .collect::<Vec<String>>();
-            dbg!(links.len());
-            for link in &links {
-                self.add_link(link);
+            if i >= 10_000 {
+                break;
+            }
+            if let Ok(entry) = e {
+                let path = entry.get_path();
+                if let Some(p) = Page::from_entry(entry, &self.a) {
+                    self.link_to_page.insert(path, p);
+                } else {
+                    page_err_count += 1;
+                }
+            } else {
+                entry_err_count += 1;
             }
         }
+        let duration = Instant::now().duration_since(start);
+        dbg!(duration);
+        dbg!(page_err_count, entry_err_count);
+        dbg!(self.link_to_page.len());
+    }
+
+    pub fn save_bin(&self) -> std::io::Result<()> {
+        let encoded =
+            bincode::encode_to_vec(&self.link_to_page, bincode::config::standard()).unwrap();
+        std::fs::write(WIKI_GRAPH_PATH, encoded)?;
+        Ok(())
+    }
+
+    pub fn load_bin(zim_path: &str) -> std::io::Result<Self> {
+        let a = Archive::new(zim_path).unwrap();
+        let bytes = std::fs::read(WIKI_GRAPH_PATH)?;
+        let link_to_page: HashMap<String, Page> =
+            bincode::decode_from_slice(&bytes, bincode::config::standard())
+                .unwrap()
+                .0;
+        Ok(WikiGraph { a, link_to_page })
     }
 }
 
 fn main() {
     let file_path = "wikipedia_en_medicine_nopic_2025-09.zim";
     let mut wiki_graph = WikiGraph::new(file_path);
-    let e = wiki_graph.a.get_randomentry().unwrap();
-    dbg!(e.get_title());
-    wiki_graph.add_link(&e.get_path());
-    wiki_graph.expand(5);
-    dbg!(wiki_graph
-        .link_to_page
-        .values()
-        .flat_map(|p| p.all_links.iter())
-        .count());
+    wiki_graph.get_all();
+    // dbg!(wiki_graph.a.get_articlecount());
+    //
+    // let e = wiki_graph.a.get_randomentry().unwrap();
+    // dbg!(e.get_title());
+    // wiki_graph.add_link(&e.get_path());
+    // wiki_graph.expand();
+    // wiki_graph.save_bin().unwrap();
 }
