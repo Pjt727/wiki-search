@@ -923,6 +923,7 @@ dependencies = [
  "scraper",
  "serde",
  "zim-rs",
+ "zim-sys",
 ]
 
 [[package]]
@@ -988,8 +989,6 @@ dependencies = [
 [[package]]
 name = "zim-sys"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ead8c78f52f94e92449733770bbaf032373ce09dd7d2a6de9119c06966d54968"
 dependencies = [
  "cxx",
  "cxx-build",

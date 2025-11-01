@@ -3,7 +3,7 @@ use lasso::*;
 use lasso::{Spur, ThreadedRodeo};
 use ordered_float::OrderedFloat;
 use rand::rng;
-use rand::seq::{IndexedRandom, SliceRandom};
+use rand::seq::IndexedRandom;
 use rayon::prelude::*;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
+use std::task::Wake;
 use std::time::Instant;
 use zim_rs::archive::Archive;
 use zim_rs::entry::Entry as ZimEntry;
@@ -50,6 +51,12 @@ struct Page {
     links_to_weight: HashMap<Spur, LinkInfo>,
 }
 
+#[derive(Debug, Clone)]
+struct PathInfo {
+    distance: f32,
+    path: Vec<Spur>,
+}
+
 impl Page {
     fn from_entry(e: ZimEntry, interner: &ThreadedRodeo) -> Option<Self> {
         let i = e.get_item(true).ok()?;
@@ -63,6 +70,9 @@ impl Page {
         let all_links = doc
             .select(&selector)
             .filter_map(|e| e.attr("href"))
+            .filter(|href| {
+                !href.starts_with("http") && !href.starts_with("#") && !href.starts_with("../")
+            })
             .fold(
                 (HashSet::new(), Vec::new()),
                 |(mut seen_paths, mut paths), p| {
@@ -129,11 +139,8 @@ impl WikiGraph {
         let mut entry_iter = self.a.iter_efficient().unwrap().into_iter();
         let mut count = 0;
         loop {
-            let entries: Vec<ZimEntry> = entry_iter
-                .by_ref()
-                .map(|e| e.unwrap())
-                .take(5_000)
-                .collect();
+            let entries: Vec<ZimEntry> =
+                entry_iter.by_ref().map(|e| e.unwrap()).take(100).collect();
             if entries.is_empty() {
                 break;
             }
@@ -213,70 +220,87 @@ impl WikiGraph {
     pub fn resolve(&self, key: Spur) -> &str {
         self.interner.resolve(&key)
     }
+
+    pub fn get_random_article(&self) -> Option<Spur> {
+        let entry = self.a.get_randomentry().ok()?;
+        let path = entry.get_path();
+        Some(self.interner.get_or_intern(&path))
+    }
+
     fn get_close_titles(
         &self,
         first_link: Spur,
         count: usize,
         min_distance: f32,
         max_distance: f32,
-    ) -> Vec<(Page, f32)> {
-        let mut link_to_distance: HashMap<Spur, OrderedFloat<f32>> = HashMap::new();
+    ) -> Vec<PathInfo> {
+        let mut link_to_path_info: HashMap<Spur, PathInfo> = HashMap::new();
+        let mut visited: HashSet<Spur> = HashSet::new();
         let mut next_pages = BinaryHeap::new();
         // add the first page
         next_pages.push(PrioritizedPage {
-            priority: Reverse(OrderedFloat(-1_f32)),
+            priority: Reverse(OrderedFloat(0.0)),
             link: first_link,
+            path: vec![first_link],
         });
 
         while let Some(p) = next_pages.pop() {
-            let link_page = self.link_to_page.get(&p.link).unwrap();
+            // Skip if we've already processed this node with a shorter distance
+            if !visited.insert(p.link) {
+                continue;
+            }
+
+            let link_page = self.link_to_page.get(&p.link);
+            if link_page.is_none() {
+                continue;
+            }
+            let link_page = link_page.unwrap();
 
             for (link, info) in link_page.value().links_to_weight.clone() {
-                let total_distance = p.priority.0 .0 + info.weight;
-                if total_distance + 1_f32 > max_distance {
+                let total_distance = p.priority.0.0 + info.weight + 1_f32;
+                if total_distance > max_distance {
                     continue;
                 }
-                let prio_page = PrioritizedPage {
-                    priority: Reverse(OrderedFloat(total_distance + 1_f32)),
-                    link,
-                };
-                if total_distance > min_distance && total_distance < max_distance {
-                    match link_to_distance.entry(link) {
-                        Entry::Occupied(mut occupied_entry) => {
-                            let current_score = occupied_entry.get_mut();
-                            if OrderedFloat(total_distance) < *current_score {
-                                println!("Found a new fastest route to {}", self.resolve(link));
-                                *current_score = OrderedFloat(total_distance);
-                                next_pages.push(prio_page);
-                            }
-                        }
-                        Entry::Vacant(vacant_entry) => {
-                            vacant_entry.insert(OrderedFloat(total_distance));
-                            next_pages.push(prio_page);
-                        }
-                    }
+
+                // Skip if already visited with a shorter path
+                if visited.contains(&link) {
+                    continue;
                 }
+
+                let mut new_path = p.path.clone();
+                new_path.push(link);
+
+                if total_distance >= min_distance && total_distance <= max_distance {
+                    link_to_path_info.entry(link).or_insert(PathInfo {
+                        distance: total_distance,
+                        path: new_path.clone(),
+                    });
+                }
+
+                next_pages.push(PrioritizedPage {
+                    priority: Reverse(OrderedFloat(total_distance)),
+                    link,
+                    path: new_path,
+                });
             }
         }
 
-        let canidates: Vec<_> = link_to_distance.keys().collect();
+        let candidates: Vec<_> = link_to_path_info.values().cloned().collect();
+        println!("candidate count {}", candidates.len());
 
         let mut rng = rng();
-        canidates
+        candidates
             .choose_multiple(&mut rng, count)
-            .map(|link| {
-                let link_page = self.link_to_page.get(link).unwrap();
-                let distance = link_to_distance.get(link).unwrap();
-                (link_page.value().clone(), distance.0)
-            })
+            .cloned()
             .collect()
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PrioritizedPage {
     pub priority: Reverse<OrderedFloat<f32>>,
     pub link: Spur,
+    pub path: Vec<Spur>,
 }
 
 impl PartialEq for PrioritizedPage {
@@ -299,15 +323,66 @@ impl Ord for PrioritizedPage {
     }
 }
 
-fn main() {
-    let file_path = "wikipedia_en_medicine_nopic_2025-09.zim";
+fn closest_members() {
+    let file_path = "wikipedia_en_medicine_nopic_2025-10.zim";
     // let mut wiki_graph = WikiGraph::new(file_path);
     let wiki_graph = WikiGraph::load_bin(file_path).unwrap();
-    println!("Loaded arctiles: {}", wiki_graph.link_to_page.len());
-    let mut links = wiki_graph.link_to_page.iter();
-    let link = links.nth(200).unwrap();
-    println!("Entry: {}", wiki_graph.resolve(*link.key()));
-    wiki_graph.get_close_titles(*link.key(), 5, 1.0, 3.0);
-    // wiki_graph.get_all();
-    // wiki_graph.save_bin().unwrap();
+    println!("Loaded articles: {}", wiki_graph.link_to_page.len());
+
+    // Try to get a random starting article that exists in the graph
+    let random_start = loop {
+        if let Some(candidate) = wiki_graph.get_random_article() {
+            match wiki_graph.link_to_page.contains_key(&candidate)
+                && !wiki_graph
+                    .link_to_page
+                    .get(&candidate)
+                    .unwrap()
+                    .links_to_weight
+                    .is_empty()
+            {
+                true => break candidate,
+                false => continue,
+            };
+        };
+    };
+
+    println!(
+        "\nRandom starting article: {}",
+        wiki_graph.resolve(random_start)
+    );
+
+    // Find close articles within distance range
+    let close_articles = wiki_graph.get_close_titles(random_start, 10, 2.0, 10.0);
+
+    println!(
+        "\nFound {} articles within distance 1.0-3.0:",
+        close_articles.len()
+    );
+
+    // Display paths to each close article
+    for path_info in close_articles {
+        let target = path_info.path.last().unwrap();
+        println!(
+            "\n--- Path to: {} (distance: {:.2}) ---",
+            wiki_graph.resolve(*target),
+            path_info.distance
+        );
+
+        for (i, link) in path_info.path.iter().enumerate() {
+            println!("  {}. {}", i + 1, wiki_graph.resolve(*link));
+        }
+    }
+}
+
+fn get_all() {
+    let file_path = "wikipedia_en_medicine_nopic_2025-10.zim";
+    let mut wiki_graph = WikiGraph::new(file_path);
+
+    wiki_graph.get_all();
+    wiki_graph.save_bin().unwrap();
+}
+
+fn main() {
+    closest_members();
+    // get_all();
 }
