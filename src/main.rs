@@ -18,6 +18,7 @@ use zim_rs::entry::Entry as ZimEntry;
 
 const WIKI_GRAPH_PATH: &str = "wiki-graph";
 const INTERNER_PATH: &str = "wiki-interner";
+const ZIM_PATH: &str = "wikipedia_en_simple_all_nopic_2025-09.zim";
 
 fn hash_to_dash<K, V>(hm: HashMap<K, V>) -> DashMap<K, V>
 where
@@ -52,9 +53,9 @@ struct Page {
 }
 
 #[derive(Debug, Clone)]
-struct PathInfo {
-    distance: f32,
-    path: Vec<Spur>,
+pub struct PathInfo {
+    pub distance: f32,
+    pub path: Vec<Spur>,
 }
 
 impl Page {
@@ -71,7 +72,10 @@ impl Page {
             .select(&selector)
             .filter_map(|e| e.attr("href"))
             .filter(|href| {
-                !href.starts_with("http") && !href.starts_with("#") && !href.starts_with("../")
+                !href.starts_with("http")
+                    && !href.starts_with("#")
+                    && !href.starts_with("../")
+                    && !href.starts_with("_assets")
             })
             .fold(
                 (HashSet::new(), Vec::new()),
@@ -294,6 +298,39 @@ impl WikiGraph {
             .cloned()
             .collect()
     }
+
+    pub fn find_shortest_path(&self, first_link: Spur, target_link: Spur) -> Option<Vec<Spur>> {
+        self.iter_close_titles(first_link, 0.0, None)
+            .filter_map(|p| {
+                if *p.path.last().unwrap() == target_link {
+                    return Some(p.path);
+                }
+                None
+            })
+            .next()
+    }
+
+    pub fn iter_close_titles(
+        &self,
+        first_link: Spur,
+        min_distance: f32,
+        max_distance: Option<f32>,
+    ) -> ClosestPagesIter<'_> {
+        let mut next_pages = BinaryHeap::new();
+        next_pages.push(PrioritizedPage {
+            priority: Reverse(OrderedFloat(0.0)),
+            link: first_link,
+            path: vec![first_link],
+        });
+
+        ClosestPagesIter {
+            wiki_graph: self,
+            visited: HashSet::new(),
+            next_pages,
+            min_distance,
+            max_distance,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -323,12 +360,76 @@ impl Ord for PrioritizedPage {
     }
 }
 
-fn closest_members() {
-    let file_path = "wikipedia_en_medicine_nopic_2025-10.zim";
-    // let mut wiki_graph = WikiGraph::new(file_path);
-    let wiki_graph = WikiGraph::load_bin(file_path).unwrap();
-    println!("Loaded articles: {}", wiki_graph.link_to_page.len());
+pub struct ClosestPagesIter<'a> {
+    wiki_graph: &'a WikiGraph,
+    visited: HashSet<Spur>,
+    next_pages: BinaryHeap<PrioritizedPage>,
+    min_distance: f32,
+    max_distance: Option<f32>,
+}
 
+impl<'a> Iterator for ClosestPagesIter<'a> {
+    type Item = PathInfo;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(p) = self.next_pages.pop() {
+            // Skip if already visited
+            if !self.visited.insert(p.link) {
+                continue;
+            }
+
+            let distance = p.priority.0.0;
+
+            // Stop if we've exceeded max distance
+            if self
+                .max_distance
+                .is_some_and(|max_distance| distance > max_distance)
+            {
+                return None;
+            }
+
+            // Get the page from the graph
+            if let Some(link_page) = self.wiki_graph.link_to_page.get(&p.link) {
+                // Add neighbors to priority queue
+                for (link, info) in link_page.value().links_to_weight.clone() {
+                    let total_distance = distance + info.weight + 1_f32;
+
+                    if self
+                        .max_distance
+                        .is_some_and(|max_distance| total_distance > max_distance)
+                        || self.visited.contains(&link)
+                    {
+                        continue;
+                    }
+
+                    let mut new_path = p.path.clone();
+                    new_path.push(link);
+
+                    self.next_pages.push(PrioritizedPage {
+                        priority: Reverse(OrderedFloat(total_distance)),
+                        link,
+                        path: new_path,
+                    });
+                }
+            }
+
+            // Return this page if it's within the distance range
+            if distance >= self.min_distance
+                && self
+                    .max_distance
+                    .is_none_or(|max_distance| max_distance >= distance)
+            {
+                return Some(PathInfo {
+                    distance,
+                    path: p.path,
+                });
+            }
+        }
+        None
+    }
+}
+
+fn get_exists(wiki_graph: &WikiGraph) -> Spur {
     // Try to get a random starting article that exists in the graph
     let random_start = loop {
         if let Some(candidate) = wiki_graph.get_random_article() {
@@ -345,44 +446,55 @@ fn closest_members() {
             };
         };
     };
+    random_start
+}
 
-    println!(
-        "\nRandom starting article: {}",
-        wiki_graph.resolve(random_start)
-    );
-
-    // Find close articles within distance range
-    let close_articles = wiki_graph.get_close_titles(random_start, 10, 2.0, 10.0);
-
-    println!(
-        "\nFound {} articles within distance 1.0-3.0:",
-        close_articles.len()
-    );
-
-    // Display paths to each close article
-    for path_info in close_articles {
-        let target = path_info.path.last().unwrap();
-        println!(
-            "\n--- Path to: {} (distance: {:.2}) ---",
-            wiki_graph.resolve(*target),
-            path_info.distance
-        );
-
-        for (i, link) in path_info.path.iter().enumerate() {
-            println!("  {}. {}", i + 1, wiki_graph.resolve(*link));
-        }
+fn closest_members() {
+    let file_path = "wikipedia_en_medicine_nopic_2025-10.zim";
+    // let mut wiki_graph = WikiGraph::new(file_path);
+    let wiki_graph = WikiGraph::load_bin(file_path).unwrap();
+    println!("Loaded articles: {}", wiki_graph.link_to_page.len());
+    for p in wiki_graph.link_to_page.iter() {
+        println!("{}", wiki_graph.resolve(*p.key()));
     }
 }
 
 fn get_all() {
-    let file_path = "wikipedia_en_medicine_nopic_2025-10.zim";
+    let file_path = "wikipedia_en_simple_all_nopic_2025-09.zim";
     let mut wiki_graph = WikiGraph::new(file_path);
 
     wiki_graph.get_all();
+    println!("Got {} articles", wiki_graph.link_to_page.len());
     wiki_graph.save_bin().unwrap();
 }
 
+fn get_best_links() {
+    let wiki_graph = WikiGraph::load_bin(ZIM_PATH).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    let first_link = wiki_graph.interner.get_or_intern(args.get(1).unwrap());
+    let target_link = wiki_graph.interner.get_or_intern(args.get(2).unwrap());
+
+    let best_path = wiki_graph.find_shortest_path(first_link, target_link);
+    println!(
+        "{} -> {}\n",
+        wiki_graph.interner.resolve(&first_link),
+        wiki_graph.interner.resolve(&target_link)
+    );
+    match best_path {
+        Some(p) => {
+            for link in p {
+                println!("{}", wiki_graph.interner.resolve(&link));
+            }
+        }
+        None => println!("No path exists"),
+    }
+}
+
 fn main() {
-    closest_members();
+    // closest_members();
     // get_all();
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 {
+        get_best_links();
+    }
 }
